@@ -8,39 +8,16 @@ permissions:
   contents: read
 
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64, x86, aarch64, armv7, s390x, ppc64le]
-    steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'  # Фиксируем версию Python
-    - name: Build wheels
-      uses: PyO3/maturin-action@v1
-      with:
-        target: ${{ matrix.target }}
-        args: --release --out dist --find-interpreter
-        sccache: 'true'
-        manylinux: auto
-    - name: Upload wheels
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheels-linux-${{ matrix.target }}
-        path: dist
-
   windows:
     runs-on: windows-latest
     strategy:
       matrix:
-        target: [x64, x86]
+        target: [x64]
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.12'  # Фиксируем версию Python
+        python-version: '3.11.9'
         architecture: ${{ matrix.target }}
     - name: Build wheels
       uses: PyO3/maturin-action@v1
@@ -54,16 +31,39 @@ jobs:
         name: wheels-windows-${{ matrix.target }}
         path: dist
 
-  macos:
-    runs-on: macos-latest
+  linux:
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        target: [x86_64]
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.12'  # Фиксируем версию Python
+        python-version: '3.11.9'
+    - name: Build wheels
+      uses: PyO3/maturin-action@v1
+      with:
+        target: ${{ matrix.target }}
+        args: --release --out dist --find-interpreter
+        sccache: 'true'
+        manylinux: auto
+    - name: Upload wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-linux-${{ matrix.target }}
+        path: dist
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11.9'
     - name: Build wheels
       uses: PyO3/maturin-action@v1
       with:
@@ -82,7 +82,7 @@ jobs:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.12'
+        python-version: '3.11.9'
     - name: Build sdist
       uses: PyO3/maturin-action@v1
       with:

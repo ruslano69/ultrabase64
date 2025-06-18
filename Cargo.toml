@@ -1,6 +1,6 @@
 [package]
 name = "ultrabase64"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 authors = ["Your Name <ruslano69@gmail.com>"]
 description = "Ultra-fast Base64 encoding/decoding library with SIMD and multithreading support"
