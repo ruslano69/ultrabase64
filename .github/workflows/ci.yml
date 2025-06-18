@@ -23,10 +23,8 @@ jobs:
       uses: PyO3/maturin-action@v1
       with:
         target: ${{ matrix.target }}
-        args: --release --out dist --find-interpreter --skip pp311
+        args: --release --out dist --find-interpreter
         sccache: 'true'
-      env:
-        PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
