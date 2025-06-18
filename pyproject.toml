@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ultrabase64"
-version = "1.0.1"
+version = "1.0.2"
 description = "Ultra-fast Base64 encoding/decoding library with SIMD and multithreading support"
 authors = [
     {name = "Your Name", email = "your.email@example.com"},
