@@ -1,4 +1,4 @@
-// src/lib.rs - СОВМЕСТИМОСТЬ С PyO3 0.22
+// src/lib.rs - СТАБИЛЬНАЯ ВЕРСИЯ ДЛЯ PyO3 0.21
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rayon::prelude::*;
@@ -95,8 +95,8 @@ fn is_valid_base64_length(len: usize) -> bool {
 /// Raises:
 ///     ValueError: If input is too large
 #[pyfunction]
-fn encode(py: Python, data: Bound<PyBytes>) -> PyResult<String> {
-    let input_data = data.as_bytes(); // В PyO3 0.22 as_bytes() работает на Bound<PyBytes>
+fn encode(py: Python, data: &PyBytes) -> PyResult<String> {
+    let input_data = data.as_bytes();
 
     // Проверка размера для защиты от OOM
     if input_data.len() > MAX_INPUT_SIZE {
@@ -129,7 +129,7 @@ fn encode(py: Python, data: Bound<PyBytes>) -> PyResult<String> {
 /// Raises:
 ///     ValueError: If input is invalid Base64
 #[pyfunction]
-fn decode(py: Python, data: &str) -> PyResult<Bound<PyBytes>> {
+fn decode(py: Python, data: &str) -> PyResult<PyObject> {
     // Быстрые проверки
     if data.len() > MAX_INPUT_SIZE {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -143,14 +143,17 @@ fn decode(py: Python, data: &str) -> PyResult<Bound<PyBytes>> {
         ));
     }
 
+    // Скопируем строку для использования в allow_threads
+    let data_owned = data.to_owned();
+
     py.allow_threads(move || {
-        let decoded_bytes = general_purpose::STANDARD.decode(data)
+        let decoded_bytes = general_purpose::STANDARD.decode(data_owned)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("Invalid Base64: {}", e)
             ))?;
         
-        // В PyO3 0.22 используем PyBytes::new_bound
-        Ok(PyBytes::new_bound(py, &decoded_bytes))
+        // Создаем PyBytes в основном потоке
+        Ok(Python::with_gil(|py| PyBytes::new(py, &decoded_bytes).into()))
     })
 }
 
@@ -163,7 +166,7 @@ fn decode(py: Python, data: &str) -> PyResult<Bound<PyBytes>> {
 /// Returns:
 ///     Base64 encoded string
 #[pyfunction]
-fn encode_with_threads(py: Python, data: Bound<PyBytes>, threads: usize) -> PyResult<String> {
+fn encode_with_threads(py: Python, data: &PyBytes, threads: usize) -> PyResult<String> {
     let input_data = data.as_bytes();
     
     if input_data.len() > MAX_INPUT_SIZE {
@@ -198,7 +201,7 @@ fn get_info() -> PyResult<std::collections::HashMap<String, String>> {
 
 /// Python модуль ultrabase64.
 #[pymodule]
-fn ultrabase64(m: &Bound<PyModule>) -> PyResult<()> {
+fn ultrabase64(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode_with_threads, m)?)?;

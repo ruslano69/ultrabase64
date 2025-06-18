@@ -17,7 +17,7 @@ name = "ultrabase64"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.21", features = ["extension-module"] }
 base64 = "0.21"  # Используем стабильную версию
 rayon = "1.8"
 num_cpus = "1.16"
