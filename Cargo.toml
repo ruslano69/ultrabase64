@@ -1,0 +1,38 @@
+[package]
+name = "ultrabase64"
+version = "1.0.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Ultra-fast Base64 encoding/decoding library with SIMD and multithreading support"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/ultrabase64"
+homepage = "https://github.com/yourusername/ultrabase64"
+readme = "README.md"
+keywords = ["base64", "encoding", "simd", "multithreading", "performance"]
+categories = ["encoding", "algorithms"]
+rust-version = "1.70"
+
+[lib]
+name = "ultrabase64"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module"] }
+base64 = "0.22"  # Обновленная версия с новым API
+rayon = "1.8"
+num_cpus = "1.16"
+
+[build-dependencies]
+pyo3-build-config = "0.20"
+
+# Оптимизации для релиза
+[profile.release]
+opt-level = 3           # Максимальная оптимизация
+lto = true             # Link Time Optimization
+codegen-units = 1      # Лучшие оптимизации
+panic = "abort"        # Меньший размер бинарника
+strip = true          # Удаляем отладочную информацию
+
+# Оптимизации зависимостей даже в debug режиме
+[profile.dev.package."*"]
+opt-level = 2
