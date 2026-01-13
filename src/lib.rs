@@ -146,14 +146,53 @@ fn encode(py: Python, data: &PyBytes) -> PyResult<String> {
     })
 }
 
+/// Кодирует байты в Base64 и возвращает bytes (максимальная производительность).
+///
+/// Аналогичен encode(), но возвращает bytes вместо string для максимальной
+/// производительности. Используйте когда результат не нужно конвертировать в string.
+///
+/// Args:
+///     data: Bytes to encode
+///
+/// Returns:
+///     Base64 encoded bytes (ASCII)
+///
+/// Raises:
+///     ValueError: If input is too large
+#[pyfunction]
+fn encode_bytes(py: Python, data: &PyBytes) -> PyResult<PyObject> {
+    let input_data = data.as_bytes();
+
+    // Проверка размера для защиты от OOM
+    if input_data.len() > MAX_INPUT_SIZE {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            format!("Input too large: {} bytes (max: {} bytes)",
+                   input_data.len(), MAX_INPUT_SIZE)
+        ));
+    }
+
+    py.allow_threads(move || {
+        let encoded_string = if input_data.len() < MULTITHREAD_THRESHOLD {
+            // Для небольших данных - обычное кодирование с SIMD
+            general_purpose::STANDARD.encode(input_data)
+        } else {
+            // Для больших данных - многопоточность
+            encode_multithreaded(input_data, get_optimal_threads())
+        };
+
+        // Конвертируем String в bytes для максимальной производительности
+        Ok(Python::with_gil(|py| PyBytes::new(py, encoded_string.as_bytes()).into()))
+    })
+}
+
 /// Декодирует строку Base64 в байты.
 ///
 /// Args:
 ///     data: Base64 string to decode
-/// 
+///
 /// Returns:
 ///     Decoded bytes
-/// 
+///
 /// Raises:
 ///     ValueError: If input is invalid Base64
 #[pyfunction]
@@ -392,6 +431,7 @@ fn decode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
 #[pymodule]
 fn ultrabase64(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode_with_threads, m)?)?;
     m.add_function(wrap_pyfunction!(encode_file_streaming, m)?)?;
