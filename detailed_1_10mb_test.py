@@ -83,8 +83,13 @@ def main():
     print("System Information:")
     print(f"  Available CPUs: {info['available_cpus']}")
     print(f"  Rayon threads: {info['rayon_threads']}")
-    print(f"  Multithread threshold: {info['multithread_threshold']:,} bytes ({info['multithread_threshold']/(1024*1024):.1f} MB)")
-    print(f"  Min chunk size: {info['min_chunk_size']:,} bytes ({info['min_chunk_size']/(1024*1024):.1f} MB)")
+
+    # Конвертируем строки в числа для форматирования
+    mt_threshold = int(info['multithread_threshold'])
+    min_chunk = int(ultrabase64.MIN_CHUNK_SIZE)
+
+    print(f"  Multithread threshold: {mt_threshold:,} bytes ({mt_threshold/(1024*1024):.1f} MB)")
+    print(f"  Min chunk size: {min_chunk:,} bytes ({min_chunk/(1024*1024):.1f} MB)")
     print()
 
     # Детальный диапазон: 1-10 MB с шагом 0.5 MB
