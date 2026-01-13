@@ -4,6 +4,8 @@ use pyo3::types::PyBytes;
 use rayon::prelude::*;
 use base64::{Engine as _, engine::general_purpose};
 use std::sync::OnceLock;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 
 // --- Константы и конфигурации ---
 
@@ -12,8 +14,9 @@ use std::sync::OnceLock;
 const MULTITHREAD_THRESHOLD: usize = 1024 * 1024;
 
 /// Минимальный размер чанка для многопоточной обработки.
-/// Слишком маленькие чанки приводят к overhead.
-const MIN_CHUNK_SIZE: usize = 64 * 1024; // 64KB
+/// 1MB оптимально для L3 cache (обычно 1-2MB на ядро в современных CPU).
+/// Это минимизирует cache misses и амортизирует overhead многопоточности.
+const MIN_CHUNK_SIZE: usize = 1024 * 1024; // 1MB
 
 /// Максимальное количество потоков для кодирования.
 const MAX_THREADS: usize = 8;
@@ -26,6 +29,9 @@ const MAX_INPUT_SIZE: usize = 100 * 1024 * 1024; // 100MB
 /// Кастомный Base64 engine без padding для параллельной обработки.
 static NO_PAD_ENGINE: OnceLock<base64::engine::GeneralPurpose> = OnceLock::new();
 
+/// Кешированное количество доступных CPU для избежания повторных системных вызовов.
+static OPTIMAL_THREADS: OnceLock<usize> = OnceLock::new();
+
 fn get_no_pad_engine() -> &'static base64::engine::GeneralPurpose {
     NO_PAD_ENGINE.get_or_init(|| {
         base64::engine::GeneralPurpose::new(
@@ -33,6 +39,11 @@ fn get_no_pad_engine() -> &'static base64::engine::GeneralPurpose {
             base64::engine::general_purpose::NO_PAD
         )
     })
+}
+
+/// Получает оптимальное количество потоков (кешированное).
+fn get_optimal_threads() -> usize {
+    *OPTIMAL_THREADS.get_or_init(|| num_cpus::get().min(MAX_THREADS))
 }
 
 // --- Внутренние функции ---
@@ -47,17 +58,21 @@ fn encode_multithreaded(input: &[u8], num_threads: usize) -> String {
     // 1. РАЗДЕЛЯЕМ ДАННЫЕ НА ОСНОВНУЮ ЧАСТЬ И "ХВОСТ"
     let remainder_len = len % 3;
     let main_part_len = len - remainder_len;
-    
-    // Если основная часть слишком мала для параллелизма
-    if main_part_len < MIN_CHUNK_SIZE * num_threads {
+
+    // 2. ДИНАМИЧЕСКИ ОПРЕДЕЛЯЕМ ЭФФЕКТИВНОЕ КОЛИЧЕСТВО ПОТОКОВ
+    // Убеждаемся, что каждый поток получит минимум MIN_CHUNK_SIZE
+    let effective_threads = (main_part_len / MIN_CHUNK_SIZE).min(num_threads).max(1);
+
+    // Если не хватает данных даже для 2 потоков, используем single-threaded режим
+    if effective_threads < 2 {
         return general_purpose::STANDARD.encode(input);
     }
-    
+
     let (main_part, tail_part) = input.split_at(main_part_len);
 
-    // 2. ВЫЧИСЛЯЕМ ОПТИМАЛЬНЫЙ РАЗМЕР ЧАНКА
-    let chunk_size = (main_part_len / num_threads / 3) * 3;
-    let chunk_size = chunk_size.max(MIN_CHUNK_SIZE);
+    // 3. ВЫЧИСЛЯЕМ РАЗМЕР ЧАНКА (кратный 3 для правильного Base64 кодирования)
+    // Распределяем данные равномерно между потоками
+    let chunk_size = (main_part_len / effective_threads / 3) * 3;
 
     // 3. ПАРАЛЛЕЛЬНО КОДИРУЕМ ОСНОВНУЮ ЧАСТЬ (без padding'а)
     let no_pad_engine = get_no_pad_engine();
@@ -66,12 +81,25 @@ fn encode_multithreaded(input: &[u8], num_threads: usize) -> String {
         .map(|chunk| no_pad_engine.encode(chunk))
         .collect();
 
-    // 4. ДОБАВЛЯЕМ "ХВОСТ" (с padding если нужен)
-    let mut result = encoded_parts.join("");
-    if !tail_part.is_empty() {
-        result.push_str(&general_purpose::STANDARD.encode(tail_part));
+    // 4. ЭФФЕКТИВНАЯ КОНКАТЕНАЦИЯ: предвычисляем размер для единой аллокации
+    let total_len: usize = encoded_parts.iter().map(|s| s.len()).sum();
+    let tail_encoded = if !tail_part.is_empty() {
+        general_purpose::STANDARD.encode(tail_part)
+    } else {
+        String::new()
+    };
+
+    let mut result = String::with_capacity(total_len + tail_encoded.len());
+
+    // Добавляем все части без реаллокаций
+    for part in encoded_parts {
+        result.push_str(&part);
     }
-    
+
+    if !tail_encoded.is_empty() {
+        result.push_str(&tail_encoded);
+    }
+
     result
 }
 
@@ -112,8 +140,7 @@ fn encode(py: Python, data: &PyBytes) -> PyResult<String> {
             Ok(general_purpose::STANDARD.encode(input_data))
         } else {
             // Для больших данных - многопоточность
-            let num_threads = num_cpus::get().min(MAX_THREADS);
-            Ok(encode_multithreaded(input_data, num_threads))
+            Ok(encode_multithreaded(input_data, get_optimal_threads()))
         }
     })
 }
@@ -199,12 +226,175 @@ fn get_info() -> PyResult<std::collections::HashMap<String, String>> {
     Ok(info)
 }
 
+/// Кодирует файл в Base64 с использованием streaming (конвейерной обработки).
+/// Файл читается и обрабатывается чанками по 1MB, что позволяет:
+/// - Обрабатывать файлы любого размера без ограничения MAX_INPUT_SIZE
+/// - Минимизировать потребление памяти
+/// - Оптимально использовать L3 cache процессора
+///
+/// Args:
+///     input_path: Путь к входному файлу для кодирования
+///     output_path: Путь к выходному файлу (будет содержать Base64)
+///
+/// Returns:
+///     Количество обработанных байт
+#[pyfunction]
+fn encode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyResult<u64> {
+    py.allow_threads(move || {
+        let input_file = File::open(input_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to open input file: {}", e)
+            ))?;
+
+        let output_file = File::create(output_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to create output file: {}", e)
+            ))?;
+
+        let mut reader = BufReader::new(input_file);
+        let mut writer = BufWriter::new(output_file);
+
+        // Буфер для чтения. Размер кратен 3 для правильного Base64 кодирования
+        // без padding между чанками. 1MB = оптимально для L3 cache
+        let buffer_size = MIN_CHUNK_SIZE;
+        let mut buffer = vec![0u8; buffer_size];
+        let mut total_bytes = 0u64;
+
+        // Буфер для остатка от предыдущей итерации (если размер не кратен 3)
+        let mut remainder = Vec::new();
+
+        loop {
+            // Читаем данные
+            let bytes_read = reader.read(&mut buffer)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                    format!("Failed to read from file: {}", e)
+                ))?;
+
+            if bytes_read == 0 {
+                // Конец файла - обрабатываем остаток если есть
+                if !remainder.is_empty() {
+                    let encoded = general_purpose::STANDARD.encode(&remainder);
+                    writer.write_all(encoded.as_bytes())
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                            format!("Failed to write to file: {}", e)
+                        ))?;
+                }
+                break;
+            }
+
+            total_bytes += bytes_read as u64;
+
+            // Объединяем остаток с новыми данными
+            let mut data_to_process = Vec::with_capacity(remainder.len() + bytes_read);
+            data_to_process.extend_from_slice(&remainder);
+            data_to_process.extend_from_slice(&buffer[..bytes_read]);
+
+            // Разделяем на основную часть (кратную 3) и новый остаток
+            let remainder_len = data_to_process.len() % 3;
+            let main_len = data_to_process.len() - remainder_len;
+
+            // Кодируем основную часть без padding
+            if main_len > 0 {
+                let encoded = get_no_pad_engine().encode(&data_to_process[..main_len]);
+                writer.write_all(encoded.as_bytes())
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                        format!("Failed to write to file: {}", e)
+                    ))?;
+            }
+
+            // Сохраняем остаток для следующей итерации
+            remainder.clear();
+            if remainder_len > 0 {
+                remainder.extend_from_slice(&data_to_process[main_len..]);
+            }
+        }
+
+        writer.flush()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to flush output: {}", e)
+            ))?;
+
+        Ok(total_bytes)
+    })
+}
+
+/// Декодирует Base64 файл с использованием streaming (конвейерной обработки).
+///
+/// Args:
+///     input_path: Путь к Base64 файлу для декодирования
+///     output_path: Путь к выходному файлу (будет содержать исходные данные)
+///
+/// Returns:
+///     Количество декодированных байт
+#[pyfunction]
+fn decode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyResult<u64> {
+    py.allow_threads(move || {
+        let input_file = File::open(input_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to open input file: {}", e)
+            ))?;
+
+        let output_file = File::create(output_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to create output file: {}", e)
+            ))?;
+
+        let mut reader = BufReader::new(input_file);
+        let mut writer = BufWriter::new(output_file);
+
+        // Буфер для чтения Base64 данных. Размер кратен 4 для правильного декодирования
+        // 1MB закодированных данных соответствует ~750KB исходных
+        let buffer_size = (MIN_CHUNK_SIZE / 3) * 4; // Кратен 4
+        let mut buffer = vec![0u8; buffer_size];
+        let mut total_bytes = 0u64;
+
+        loop {
+            let bytes_read = reader.read(&mut buffer)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                    format!("Failed to read from file: {}", e)
+                ))?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            // Конвертируем байты в строку
+            let base64_str = std::str::from_utf8(&buffer[..bytes_read])
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid UTF-8 in Base64 file: {}", e)
+                ))?;
+
+            // Декодируем
+            let decoded = general_purpose::STANDARD.decode(base64_str)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid Base64: {}", e)
+                ))?;
+
+            total_bytes += decoded.len() as u64;
+
+            writer.write_all(&decoded)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                    format!("Failed to write to file: {}", e)
+                ))?;
+        }
+
+        writer.flush()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to flush output: {}", e)
+            ))?;
+
+        Ok(total_bytes)
+    })
+}
+
 /// Python модуль ultrabase64.
 #[pymodule]
 fn ultrabase64(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode_with_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_file_streaming, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_file_streaming, m)?)?;
     m.add_function(wrap_pyfunction!(get_info, m)?)?;
     
     // Константы, доступные из Python
