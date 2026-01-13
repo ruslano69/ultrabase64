@@ -49,7 +49,9 @@ fn get_optimal_threads() -> usize {
 // --- Внутренние функции ---
 
 /// Оптимизированная реализация многопоточного кодирования.
-fn encode_multithreaded(input: &[u8], num_threads: usize) -> String {
+/// Параметр _num_threads сохранен для обратной совместимости, но не используется -
+/// Rayon автоматически использует оптимальное количество потоков через work-stealing.
+fn encode_multithreaded(input: &[u8], _num_threads: usize) -> String {
     let len = input.len();
     if len == 0 {
         return String::new();
@@ -59,29 +61,28 @@ fn encode_multithreaded(input: &[u8], num_threads: usize) -> String {
     let remainder_len = len % 3;
     let main_part_len = len - remainder_len;
 
-    // 2. ДИНАМИЧЕСКИ ОПРЕДЕЛЯЕМ ЭФФЕКТИВНОЕ КОЛИЧЕСТВО ПОТОКОВ
-    // Убеждаемся, что каждый поток получит минимум MIN_CHUNK_SIZE
-    let effective_threads = (main_part_len / MIN_CHUNK_SIZE).min(num_threads).max(1);
-
-    // Если не хватает данных даже для 2 потоков, используем single-threaded режим
-    if effective_threads < 2 {
+    // 2. ПРОВЕРЯЕМ МИНИМАЛЬНЫЙ РАЗМЕР ДЛЯ МНОГОПОТОЧНОСТИ
+    // Если данных меньше чем MIN_CHUNK_SIZE * 2, fallback на single-threaded
+    if main_part_len < MIN_CHUNK_SIZE * 2 {
         return general_purpose::STANDARD.encode(input);
     }
 
     let (main_part, tail_part) = input.split_at(main_part_len);
 
-    // 3. ВЫЧИСЛЯЕМ РАЗМЕР ЧАНКА (кратный 3 для правильного Base64 кодирования)
-    // Распределяем данные равномерно между потоками
-    let chunk_size = (main_part_len / effective_threads / 3) * 3;
+    // 3. ИСПОЛЬЗУЕМ ФИКСИРОВАННЫЙ CHUNK SIZE ДЛЯ ОПТИМАЛЬНОГО L3 CACHE
+    // Rayon автоматически распределит чанки между потоками через work-stealing.
+    // Фиксированный 1MB чанк оптимален для большинства CPU (L3 cache = 1-2MB/core).
+    // ВАЖНО: chunk_size ДОЛЖЕН быть кратен 3 для корректного Base64 кодирования.
+    let chunk_size = (MIN_CHUNK_SIZE / 3) * 3;
 
-    // 3. ПАРАЛЛЕЛЬНО КОДИРУЕМ ОСНОВНУЮ ЧАСТЬ (без padding'а)
+    // 4. ПАРАЛЛЕЛЬНО КОДИРУЕМ ОСНОВНУЮ ЧАСТЬ (без padding'а)
     let no_pad_engine = get_no_pad_engine();
     let encoded_parts: Vec<String> = main_part
         .par_chunks(chunk_size)
         .map(|chunk| no_pad_engine.encode(chunk))
         .collect();
 
-    // 4. ЭФФЕКТИВНАЯ КОНКАТЕНАЦИЯ: предвычисляем размер для единой аллокации
+    // 5. ЭФФЕКТИВНАЯ КОНКАТЕНАЦИЯ: предвычисляем размер для единой аллокации
     let total_len: usize = encoded_parts.iter().map(|s| s.len()).sum();
     let tail_encoded = if !tail_part.is_empty() {
         general_purpose::STANDARD.encode(tail_part)
