@@ -21,6 +21,7 @@ pyo3 = { version = "0.21", features = ["extension-module"] }
 base64 = "0.21"  # Используем стабильную версию
 rayon = "1.8"
 num_cpus = "1.16"
+crossbeam = "0.8"  # Для конвейерной реализации
 
 # Убираем [build-dependencies] - они не нужны для простой сборки
 
