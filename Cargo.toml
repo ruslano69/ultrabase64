@@ -1,6 +1,6 @@
 [package]
 name = "ultrabase64"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 authors = ["Your Name <ruslano69@gmail.com>"]
 description = "Ultra-fast Base64 encoding/decoding library with SIMD and multithreading support"
@@ -18,7 +18,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29.2", features = ["extension-module"] }
-base64 = "0.23.1"
+base64-simd = "0.8"  # SIMD-движок кодирования/декодирования
 rayon = "1.12"
 num_cpus = "1.17"
 crossbeam = "0.8.4"  # Для конвейерной реализации

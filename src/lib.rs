@@ -1,5 +1,4 @@
-// src/lib.rs - СТАБИЛЬНАЯ ВЕРСИЯ ДЛЯ PyO3 0.29
-use base64::{engine::general_purpose, Engine as _};
+// src/lib.rs - PyO3 0.29 + base64-simd (SIMD-движок кодирования)
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
 use rayon::prelude::*;
@@ -26,20 +25,8 @@ const MAX_INPUT_SIZE: usize = 100 * 1024 * 1024; // 100MB
 
 // --- Глобальные ресурсы ---
 
-/// Кастомный Base64 engine без padding для параллельной обработки.
-static NO_PAD_ENGINE: OnceLock<base64::engine::GeneralPurpose> = OnceLock::new();
-
 /// Кешированное количество доступных CPU для избежания повторных системных вызовов.
 static OPTIMAL_THREADS: OnceLock<usize> = OnceLock::new();
-
-fn get_no_pad_engine() -> &'static base64::engine::GeneralPurpose {
-    NO_PAD_ENGINE.get_or_init(|| {
-        base64::engine::GeneralPurpose::new(
-            &base64::alphabet::STANDARD,
-            base64::engine::general_purpose::NO_PAD,
-        )
-    })
-}
 
 /// Получает оптимальное количество потоков (кешированное).
 fn get_optimal_threads() -> usize {
@@ -64,7 +51,7 @@ fn encode_multithreaded(input: &[u8], _num_threads: usize) -> String {
     // 2. ПРОВЕРЯЕМ МИНИМАЛЬНЫЙ РАЗМЕР ДЛЯ МНОГОПОТОЧНОСТИ
     // Если данных меньше чем MIN_CHUNK_SIZE * 2, fallback на single-threaded
     if main_part_len < MIN_CHUNK_SIZE * 2 {
-        return general_purpose::STANDARD.encode(input);
+        return base64_simd::STANDARD.encode_to_string(input);
     }
 
     let (main_part, tail_part) = input.split_at(main_part_len);
@@ -75,17 +62,16 @@ fn encode_multithreaded(input: &[u8], _num_threads: usize) -> String {
     // ВАЖНО: chunk_size ДОЛЖЕН быть кратен 3 для корректного Base64 кодирования.
     let chunk_size = (MIN_CHUNK_SIZE / 3) * 3;
 
-    // 4. ПАРАЛЛЕЛЬНО КОДИРУЕМ ОСНОВНУЮ ЧАСТЬ (без padding'а)
-    let no_pad_engine = get_no_pad_engine();
+    // 4. ПАРАЛЛЕЛЬНО КОДИРУЕМ ОСНОВНУЮ ЧАСТЬ (SIMD, без padding'а)
     let encoded_parts: Vec<String> = main_part
         .par_chunks(chunk_size)
-        .map(|chunk| no_pad_engine.encode(chunk))
+        .map(|chunk| base64_simd::STANDARD_NO_PAD.encode_to_string(chunk))
         .collect();
 
     // 5. ЭФФЕКТИВНАЯ КОНКАТЕНАЦИЯ: предвычисляем размер для единой аллокации
     let total_len: usize = encoded_parts.iter().map(|s| s.len()).sum();
     let tail_encoded = if !tail_part.is_empty() {
-        general_purpose::STANDARD.encode(tail_part)
+        base64_simd::STANDARD.encode_to_string(tail_part)
     } else {
         String::new()
     };
@@ -129,9 +115,9 @@ fn encode_pipeline(input: &[u8]) -> String {
     let remainder_len = n % 3;
     let main_part_len = n - remainder_len;
 
-    // Для небольших данных используем single-threaded
+    // Для небольших данных используем single-threaded (SIMD)
     if main_part_len < CHUNK_SIZE * NUM_WORKERS {
-        return general_purpose::STANDARD.encode(input);
+        return base64_simd::STANDARD.encode_to_string(input);
     }
 
     let (main_part, tail_part) = input.split_at(main_part_len);
@@ -141,7 +127,7 @@ fn encode_pipeline(input: &[u8]) -> String {
     // Pre-calculate total output size
     let main_output_len = main_part_len / 3 * 4;
     let tail_encoded = if !tail_part.is_empty() {
-        general_purpose::STANDARD.encode(tail_part)
+        base64_simd::STANDARD.encode_to_string(tail_part)
     } else {
         String::new()
     };
@@ -167,8 +153,8 @@ fn encode_pipeline(input: &[u8]) -> String {
                     // Extract chunk from input (zero-copy slice - main_part borrowed from outer scope!)
                     let chunk = &main_part[input_offset..input_offset + input_len];
 
-                    // Encode without padding
-                    let encoded = get_no_pad_engine().encode(chunk);
+                    // Encode without padding (SIMD)
+                    let encoded = base64_simd::STANDARD_NO_PAD.encode_to_string(chunk);
 
                     // Send result with chunk_idx for debugging
                     let _ = result_tx.send((chunk_idx, output_offset, encoded.into_bytes()));
@@ -245,8 +231,8 @@ fn encode(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
 
     py.detach(move || {
         if input_data.len() < MULTITHREAD_THRESHOLD {
-            // Для небольших данных - обычное кодирование с SIMD
-            Ok(general_purpose::STANDARD.encode(input_data))
+            // Для небольших данных - SIMD кодирование
+            Ok(base64_simd::STANDARD.encode_to_string(&input_data))
         } else {
             // Для больших данных - многопоточность
             Ok(encode_multithreaded(&input_data, get_optimal_threads()))
@@ -282,8 +268,8 @@ fn encode_bytes(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<Py<PyBytes>> 
 
     let encoded_string = py.detach(move || {
         if input_data.len() < MULTITHREAD_THRESHOLD {
-            // Для небольших данных - обычное кодирование с SIMD
-            general_purpose::STANDARD.encode(input_data)
+            // Для небольших данных - SIMD кодирование
+            base64_simd::STANDARD.encode_to_string(&input_data)
         } else {
             // Для больших данных - многопоточность
             encode_multithreaded(&input_data, get_optimal_threads())
@@ -355,8 +341,8 @@ fn encode_auto(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
         let len = input_data.len();
 
         if len < MULTITHREAD_THRESHOLD {
-            // Для маленьких данных - single-threaded
-            Ok(general_purpose::STANDARD.encode(input_data))
+            // Для маленьких данных - single-threaded SIMD
+            Ok(base64_simd::STANDARD.encode_to_string(&input_data))
         } else if len < 20 * 1024 * 1024 {
             // Для средних данных (1-20MB) - Rayon (оптимален для L3 cache)
             Ok(encode_multithreaded(&input_data, get_optimal_threads()))
@@ -396,9 +382,11 @@ fn decode(py: Python, data: &str) -> PyResult<Py<PyBytes>> {
     let data_owned = data.to_owned();
 
     let decoded_bytes = py.detach(move || {
-        let decoded_bytes = general_purpose::STANDARD.decode(data_owned).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Base64: {}", e))
-        })?;
+        let decoded_bytes = base64_simd::STANDARD
+            .decode_to_vec(data_owned)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Base64: {}", e))
+            })?;
         Ok::<Vec<u8>, PyErr>(decoded_bytes)
     })?;
 
@@ -427,7 +415,7 @@ fn encode_with_threads(py: Python, data: &Bound<'_, PyBytes>, threads: usize) ->
 
     py.detach(move || {
         if num_threads == 1 || input_data.len() < MIN_CHUNK_SIZE {
-            Ok(general_purpose::STANDARD.encode(input_data))
+            Ok(base64_simd::STANDARD.encode_to_string(&input_data))
         } else {
             Ok(encode_multithreaded(&input_data, num_threads))
         }
@@ -439,6 +427,7 @@ fn encode_with_threads(py: Python, data: &Bound<'_, PyBytes>, threads: usize) ->
 fn get_info() -> PyResult<std::collections::HashMap<String, String>> {
     let mut info = std::collections::HashMap::new();
     info.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
+    info.insert("engine".to_string(), "base64-simd".to_string());
     info.insert(
         "multithread_threshold".to_string(),
         MULTITHREAD_THRESHOLD.to_string(),
@@ -509,7 +498,7 @@ fn encode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
             if bytes_read == 0 {
                 // Конец файла - обрабатываем остаток если есть
                 if !remainder.is_empty() {
-                    let encoded = general_purpose::STANDARD.encode(&remainder);
+                    let encoded = base64_simd::STANDARD.encode_to_string(&remainder);
                     writer.write_all(encoded.as_bytes()).map_err(|e| {
                         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
                             "Failed to write to file: {}",
@@ -533,7 +522,8 @@ fn encode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
 
             // Кодируем основную часть без padding
             if main_len > 0 {
-                let encoded = get_no_pad_engine().encode(&data_to_process[..main_len]);
+                let encoded =
+                    base64_simd::STANDARD_NO_PAD.encode_to_string(&data_to_process[..main_len]);
                 writer.write_all(encoded.as_bytes()).map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
                         "Failed to write to file: {}",
@@ -614,10 +604,15 @@ fn decode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
                 ))
             })?;
 
-            // Декодируем
-            let decoded = general_purpose::STANDARD.decode(base64_str).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Base64: {}", e))
-            })?;
+            // Декодируем (SIMD)
+            let decoded = base64_simd::STANDARD
+                .decode_to_vec(base64_str)
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Invalid Base64: {}",
+                        e
+                    ))
+                })?;
 
             total_bytes += decoded.len() as u64;
 
