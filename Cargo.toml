@@ -10,18 +10,18 @@ homepage = "https://github.com/ruslano69/ultrabase64"
 readme = "README.md"
 keywords = ["base64", "encoding", "simd", "multithreading", "performance"]
 categories = ["encoding", "algorithms"]
-rust-version = "1.70"
+rust-version = "1.83"
 
 [lib]
 name = "ultrabase64"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.21", features = ["extension-module"] }
-base64 = "0.21"  # Используем стабильную версию
-rayon = "1.8"
-num_cpus = "1.16"
-crossbeam = "0.8"  # Для конвейерной реализации
+pyo3 = { version = "0.29.2", features = ["extension-module"] }
+base64 = "0.23.1"
+rayon = "1.12"
+num_cpus = "1.17"
+crossbeam = "0.8.4"  # Для конвейерной реализации
 
 # Убираем [build-dependencies] - они не нужны для простой сборки
 

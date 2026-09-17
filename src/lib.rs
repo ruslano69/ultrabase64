@@ -1,11 +1,11 @@
-// src/lib.rs - СТАБИЛЬНАЯ ВЕРСИЯ ДЛЯ PyO3 0.21
+// src/lib.rs - СТАБИЛЬНАЯ ВЕРСИЯ ДЛЯ PyO3 0.29
+use base64::{engine::general_purpose, Engine as _};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyModule};
 use rayon::prelude::*;
-use base64::{Engine as _, engine::general_purpose};
-use std::sync::OnceLock;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::sync::OnceLock;
 
 // --- Константы и конфигурации ---
 
@@ -36,7 +36,7 @@ fn get_no_pad_engine() -> &'static base64::engine::GeneralPurpose {
     NO_PAD_ENGINE.get_or_init(|| {
         base64::engine::GeneralPurpose::new(
             &base64::alphabet::STANDARD,
-            base64::engine::general_purpose::NO_PAD
+            base64::engine::general_purpose::NO_PAD,
         )
     })
 }
@@ -136,7 +136,7 @@ fn encode_pipeline(input: &[u8]) -> String {
 
     let (main_part, tail_part) = input.split_at(main_part_len);
 
-    let num_chunks = (main_part_len + CHUNK_SIZE_ALIGNED - 1) / CHUNK_SIZE_ALIGNED;
+    let num_chunks = main_part_len.div_ceil(CHUNK_SIZE_ALIGNED);
 
     // Pre-calculate total output size
     let main_output_len = main_part_len / 3 * 4;
@@ -199,7 +199,8 @@ fn encode_pipeline(input: &[u8]) -> String {
         }
 
         // Scoped threads автоматически join'ятся здесь при выходе из scope
-    }).expect("Thread pool failed");
+    })
+    .expect("Thread pool failed");
 
     // Append tail
     if !tail_encoded.is_empty() {
@@ -220,34 +221,35 @@ fn is_valid_base64_length(len: usize) -> bool {
 /// Кодирует байты в строку Base64.
 ///
 /// Автоматически использует SIMD и многопоточность для больших данных.
-/// 
+///
 /// Args:
 ///     data: Bytes to encode
-/// 
+///
 /// Returns:
 ///     Base64 encoded string
-/// 
+///
 /// Raises:
 ///     ValueError: If input is too large
 #[pyfunction]
-fn encode(py: Python, data: &PyBytes) -> PyResult<String> {
-    let input_data = data.as_bytes();
+fn encode(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
+    let input_data = data.as_bytes().to_vec();
 
     // Проверка размера для защиты от OOM
     if input_data.len() > MAX_INPUT_SIZE {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("Input too large: {} bytes (max: {} bytes)", 
-                   input_data.len(), MAX_INPUT_SIZE)
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Input too large: {} bytes (max: {} bytes)",
+            input_data.len(),
+            MAX_INPUT_SIZE
+        )));
     }
 
-    py.allow_threads(move || {
+    py.detach(move || {
         if input_data.len() < MULTITHREAD_THRESHOLD {
             // Для небольших данных - обычное кодирование с SIMD
             Ok(general_purpose::STANDARD.encode(input_data))
         } else {
             // Для больших данных - многопоточность
-            Ok(encode_multithreaded(input_data, get_optimal_threads()))
+            Ok(encode_multithreaded(&input_data, get_optimal_threads()))
         }
     })
 }
@@ -266,29 +268,29 @@ fn encode(py: Python, data: &PyBytes) -> PyResult<String> {
 /// Raises:
 ///     ValueError: If input is too large
 #[pyfunction]
-fn encode_bytes(py: Python, data: &PyBytes) -> PyResult<PyObject> {
-    let input_data = data.as_bytes();
+fn encode_bytes(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<Py<PyBytes>> {
+    let input_data = data.as_bytes().to_vec();
 
     // Проверка размера для защиты от OOM
     if input_data.len() > MAX_INPUT_SIZE {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("Input too large: {} bytes (max: {} bytes)",
-                   input_data.len(), MAX_INPUT_SIZE)
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Input too large: {} bytes (max: {} bytes)",
+            input_data.len(),
+            MAX_INPUT_SIZE
+        )));
     }
 
-    py.allow_threads(move || {
-        let encoded_string = if input_data.len() < MULTITHREAD_THRESHOLD {
+    let encoded_string = py.detach(move || {
+        if input_data.len() < MULTITHREAD_THRESHOLD {
             // Для небольших данных - обычное кодирование с SIMD
             general_purpose::STANDARD.encode(input_data)
         } else {
             // Для больших данных - многопоточность
-            encode_multithreaded(input_data, get_optimal_threads())
-        };
+            encode_multithreaded(&input_data, get_optimal_threads())
+        }
+    });
 
-        // Конвертируем String в bytes для максимальной производительности
-        Ok(Python::with_gil(|py| PyBytes::new(py, encoded_string.as_bytes()).into()))
-    })
+    Ok(PyBytes::new(py, encoded_string.as_bytes()).unbind())
 }
 
 /// Кодирует байты в Base64 используя конвейерную архитектуру (экспериментально).
@@ -306,20 +308,19 @@ fn encode_bytes(py: Python, data: &PyBytes) -> PyResult<PyObject> {
 /// Raises:
 ///     ValueError: If input is too large
 #[pyfunction]
-fn encode_pipeline_py(py: Python, data: &PyBytes) -> PyResult<String> {
-    let input_data = data.as_bytes();
+fn encode_pipeline_py(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
+    let input_data = data.as_bytes().to_vec();
 
     // Проверка размера для защиты от OOM
     if input_data.len() > MAX_INPUT_SIZE {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("Input too large: {} bytes (max: {} bytes)",
-                   input_data.len(), MAX_INPUT_SIZE)
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Input too large: {} bytes (max: {} bytes)",
+            input_data.len(),
+            MAX_INPUT_SIZE
+        )));
     }
 
-    py.allow_threads(move || {
-        Ok(encode_pipeline(input_data))
-    })
+    py.detach(move || Ok(encode_pipeline(&input_data)))
 }
 
 /// Кодирует байты в Base64 используя автоматический выбор алгоритма.
@@ -338,18 +339,19 @@ fn encode_pipeline_py(py: Python, data: &PyBytes) -> PyResult<String> {
 /// Raises:
 ///     ValueError: If input is too large
 #[pyfunction]
-fn encode_auto(py: Python, data: &PyBytes) -> PyResult<String> {
-    let input_data = data.as_bytes();
+fn encode_auto(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
+    let input_data = data.as_bytes().to_vec();
 
     // Проверка размера для защиты от OOM
     if input_data.len() > MAX_INPUT_SIZE {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("Input too large: {} bytes (max: {} bytes)",
-                   input_data.len(), MAX_INPUT_SIZE)
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Input too large: {} bytes (max: {} bytes)",
+            input_data.len(),
+            MAX_INPUT_SIZE
+        )));
     }
 
-    py.allow_threads(move || {
+    py.detach(move || {
         let len = input_data.len();
 
         if len < MULTITHREAD_THRESHOLD {
@@ -357,10 +359,10 @@ fn encode_auto(py: Python, data: &PyBytes) -> PyResult<String> {
             Ok(general_purpose::STANDARD.encode(input_data))
         } else if len < 20 * 1024 * 1024 {
             // Для средних данных (1-20MB) - Rayon (оптимален для L3 cache)
-            Ok(encode_multithreaded(input_data, get_optimal_threads()))
+            Ok(encode_multithreaded(&input_data, get_optimal_threads()))
         } else {
             // Для больших данных (>20MB) - Pipeline (стабильнее вне cache)
-            Ok(encode_pipeline(input_data))
+            Ok(encode_pipeline(&input_data))
         }
     })
 }
@@ -376,32 +378,31 @@ fn encode_auto(py: Python, data: &PyBytes) -> PyResult<String> {
 /// Raises:
 ///     ValueError: If input is invalid Base64
 #[pyfunction]
-fn decode(py: Python, data: &str) -> PyResult<PyObject> {
+fn decode(py: Python, data: &str) -> PyResult<Py<PyBytes>> {
     // Быстрые проверки
     if data.len() > MAX_INPUT_SIZE {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "Input too large"
+            "Input too large",
         ));
     }
-    
+
     if !is_valid_base64_length(data.len()) {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "Invalid Base64 length"
+            "Invalid Base64 length",
         ));
     }
 
-    // Скопируем строку для использования в allow_threads
+    // Скопируем строку для использования после отсоединения от интерпретатора.
     let data_owned = data.to_owned();
 
-    py.allow_threads(move || {
-        let decoded_bytes = general_purpose::STANDARD.decode(data_owned)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Invalid Base64: {}", e)
-            ))?;
-        
-        // Создаем PyBytes в основном потоке
-        Ok(Python::with_gil(|py| PyBytes::new(py, &decoded_bytes).into()))
-    })
+    let decoded_bytes = py.detach(move || {
+        let decoded_bytes = general_purpose::STANDARD.decode(data_owned).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Base64: {}", e))
+        })?;
+        Ok::<Vec<u8>, PyErr>(decoded_bytes)
+    })?;
+
+    Ok(PyBytes::new(py, &decoded_bytes).unbind())
 }
 
 /// Кодирует байты в строку Base64 с явным указанием количества потоков.
@@ -409,26 +410,26 @@ fn decode(py: Python, data: &str) -> PyResult<PyObject> {
 /// Args:
 ///     data: Bytes to encode
 ///     threads: Number of threads to use (1-16)
-/// 
+///
 /// Returns:
 ///     Base64 encoded string
 #[pyfunction]
-fn encode_with_threads(py: Python, data: &PyBytes, threads: usize) -> PyResult<String> {
-    let input_data = data.as_bytes();
-    
+fn encode_with_threads(py: Python, data: &Bound<'_, PyBytes>, threads: usize) -> PyResult<String> {
+    let input_data = data.as_bytes().to_vec();
+
     if input_data.len() > MAX_INPUT_SIZE {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "Input too large"
+            "Input too large",
         ));
     }
-    
+
     let num_threads = threads.clamp(1, MAX_THREADS * 2);
 
-    py.allow_threads(move || {
+    py.detach(move || {
         if num_threads == 1 || input_data.len() < MIN_CHUNK_SIZE {
             Ok(general_purpose::STANDARD.encode(input_data))
         } else {
-            Ok(encode_multithreaded(input_data, num_threads))
+            Ok(encode_multithreaded(&input_data, num_threads))
         }
     })
 }
@@ -438,11 +439,17 @@ fn encode_with_threads(py: Python, data: &PyBytes, threads: usize) -> PyResult<S
 fn get_info() -> PyResult<std::collections::HashMap<String, String>> {
     let mut info = std::collections::HashMap::new();
     info.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
-    info.insert("multithread_threshold".to_string(), MULTITHREAD_THRESHOLD.to_string());
+    info.insert(
+        "multithread_threshold".to_string(),
+        MULTITHREAD_THRESHOLD.to_string(),
+    );
     info.insert("max_threads".to_string(), MAX_THREADS.to_string());
     info.insert("max_input_size".to_string(), MAX_INPUT_SIZE.to_string());
     info.insert("available_cpus".to_string(), num_cpus::get().to_string());
-    info.insert("rayon_threads".to_string(), rayon::current_num_threads().to_string());
+    info.insert(
+        "rayon_threads".to_string(),
+        rayon::current_num_threads().to_string(),
+    );
     Ok(info)
 }
 
@@ -460,16 +467,23 @@ fn get_info() -> PyResult<std::collections::HashMap<String, String>> {
 ///     Количество обработанных байт
 #[pyfunction]
 fn encode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyResult<u64> {
-    py.allow_threads(move || {
-        let input_file = File::open(input_path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                format!("Failed to open input file: {}", e)
-            ))?;
+    let input_path = input_path.to_owned();
+    let output_path = output_path.to_owned();
 
-        let output_file = File::create(output_path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                format!("Failed to create output file: {}", e)
-            ))?;
+    py.detach(move || {
+        let input_file = File::open(input_path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                "Failed to open input file: {}",
+                e
+            ))
+        })?;
+
+        let output_file = File::create(output_path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                "Failed to create output file: {}",
+                e
+            ))
+        })?;
 
         let mut reader = BufReader::new(input_file);
         let mut writer = BufWriter::new(output_file);
@@ -485,19 +499,23 @@ fn encode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
 
         loop {
             // Читаем данные
-            let bytes_read = reader.read(&mut buffer)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                    format!("Failed to read from file: {}", e)
-                ))?;
+            let bytes_read = reader.read(&mut buffer).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to read from file: {}",
+                    e
+                ))
+            })?;
 
             if bytes_read == 0 {
                 // Конец файла - обрабатываем остаток если есть
                 if !remainder.is_empty() {
                     let encoded = general_purpose::STANDARD.encode(&remainder);
-                    writer.write_all(encoded.as_bytes())
-                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                            format!("Failed to write to file: {}", e)
-                        ))?;
+                    writer.write_all(encoded.as_bytes()).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                            "Failed to write to file: {}",
+                            e
+                        ))
+                    })?;
                 }
                 break;
             }
@@ -516,10 +534,12 @@ fn encode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
             // Кодируем основную часть без padding
             if main_len > 0 {
                 let encoded = get_no_pad_engine().encode(&data_to_process[..main_len]);
-                writer.write_all(encoded.as_bytes())
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                        format!("Failed to write to file: {}", e)
-                    ))?;
+                writer.write_all(encoded.as_bytes()).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Failed to write to file: {}",
+                        e
+                    ))
+                })?;
             }
 
             // Сохраняем остаток для следующей итерации
@@ -529,10 +549,9 @@ fn encode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
             }
         }
 
-        writer.flush()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                format!("Failed to flush output: {}", e)
-            ))?;
+        writer.flush().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to flush output: {}", e))
+        })?;
 
         Ok(total_bytes)
     })
@@ -548,16 +567,23 @@ fn encode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
 ///     Количество декодированных байт
 #[pyfunction]
 fn decode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyResult<u64> {
-    py.allow_threads(move || {
-        let input_file = File::open(input_path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                format!("Failed to open input file: {}", e)
-            ))?;
+    let input_path = input_path.to_owned();
+    let output_path = output_path.to_owned();
 
-        let output_file = File::create(output_path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                format!("Failed to create output file: {}", e)
-            ))?;
+    py.detach(move || {
+        let input_file = File::open(input_path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                "Failed to open input file: {}",
+                e
+            ))
+        })?;
+
+        let output_file = File::create(output_path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                "Failed to create output file: {}",
+                e
+            ))
+        })?;
 
         let mut reader = BufReader::new(input_file);
         let mut writer = BufWriter::new(output_file);
@@ -569,39 +595,43 @@ fn decode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
         let mut total_bytes = 0u64;
 
         loop {
-            let bytes_read = reader.read(&mut buffer)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                    format!("Failed to read from file: {}", e)
-                ))?;
+            let bytes_read = reader.read(&mut buffer).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to read from file: {}",
+                    e
+                ))
+            })?;
 
             if bytes_read == 0 {
                 break;
             }
 
             // Конвертируем байты в строку
-            let base64_str = std::str::from_utf8(&buffer[..bytes_read])
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Invalid UTF-8 in Base64 file: {}", e)
-                ))?;
+            let base64_str = std::str::from_utf8(&buffer[..bytes_read]).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Invalid UTF-8 in Base64 file: {}",
+                    e
+                ))
+            })?;
 
             // Декодируем
-            let decoded = general_purpose::STANDARD.decode(base64_str)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Invalid Base64: {}", e)
-                ))?;
+            let decoded = general_purpose::STANDARD.decode(base64_str).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Base64: {}", e))
+            })?;
 
             total_bytes += decoded.len() as u64;
 
-            writer.write_all(&decoded)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                    format!("Failed to write to file: {}", e)
-                ))?;
+            writer.write_all(&decoded).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to write to file: {}",
+                    e
+                ))
+            })?;
         }
 
-        writer.flush()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                format!("Failed to flush output: {}", e)
-            ))?;
+        writer.flush().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to flush output: {}", e))
+        })?;
 
         Ok(total_bytes)
     })
@@ -609,7 +639,7 @@ fn decode_file_streaming(py: Python, input_path: &str, output_path: &str) -> PyR
 
 /// Python модуль ultrabase64.
 #[pymodule]
-fn ultrabase64(_py: Python, m: &PyModule) -> PyResult<()> {
+fn ultrabase64(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_function(wrap_pyfunction!(encode_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(encode_pipeline_py, m)?)?;
@@ -628,7 +658,10 @@ fn ultrabase64(_py: Python, m: &PyModule) -> PyResult<()> {
 
     // Метаданные
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    m.add("__doc__", "Ultra-fast Base64 encoding/decoding library with SIMD and multithreading support")?;
+    m.add(
+        "__doc__",
+        "Ultra-fast Base64 encoding/decoding library with SIMD and multithreading support",
+    )?;
 
     Ok(())
 }
