@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-17
+
+### Changed
+
+#### Zero-copy входы
+- Убраны все `to_vec()`/`to_owned()` на Python-входах (`encode`, `encode_bytes`,
+  `encode_auto`, `encode_pipeline_py`, `encode_with_threads`, `decode`).
+- Для detach-блоков (требуют `'static`) время жизни среза расширяется через
+  `extend_lifetime` с документированным SAFETY-контрактом: Python-объект жив
+  весь вызов, потоки join'ятся строго внутри блока. GIL по-прежнему отпускается
+  на str-пути больших данных.
+
+#### Выделенный пул потоков
+- Новый `RAYON_POOL` на 8 потоков вместо глобального пула (32 потока на
+  16-ядерной машине): меньше oversubscription и contention за аллокатор/память.
+- `get_info()["rayon_threads"]` теперь отражает размер выделенного пула.
+
+#### Многопоточный путь без аллокаций
+- Чанки кодируются SIMD напрямую в непересекающиеся слайсы предвыделенного
+  буфера (`Out`/`AsOut`): ноль промежуточных `String`/`Vec` и конкатенаций.
+- Пропуск zeroing выходного буфера (`uninit_buffer` с доказанным покрытием).
+
+#### `encode_bytes` в один проход
+- Кодирование SIMD идёт сразу в буфер `PyBytes` через ffi (мимо
+  `PyBytes::new_with`, который молча обнуляет буфер - лишний проход).
+  Трафик памяти как у pybase64 (один проход) + потоки сверху.
+- `encode_bytes` удерживает GIL на время вызова (зато без копий);
+  str-пути больших данных GIL по-прежнему отпускают.
+
+### Performance (Ryzen 9 5950X, очно против pybase64 1.5.0 AVX2)
+
+| Блок | ENC ultra | ENC pybase64 | DEC ultra | DEC pybase64 |
+|------|-----------|--------------|-----------|--------------|
+| 128KB | 2874 MB/s (0.99x) | 2900 | **4883 (1.43x)** | 3388 |
+| 1MB | 5184 (0.98x) | 5299 | **2943 (1.10x)** | 2667 |
+| 10MB | **9223 (1.58x)** | 5827 | **2627 (1.08x)** | 2437 |
+| 20MB | **9072 (1.58x)** | 5758 | **3154 (1.18x)** | 2668 |
+
+Итого: 6 из 8 дисциплин за ultrabase64, 2 - паритет в пределах шума.
+Decode выигрывает везде; encode - на больших блоках за счёт многопоточности.
+
+No API changes - fully compatible with v1.2.x.
+
 ## [1.2.0] - 2026-09-17
 
 ### Changed
