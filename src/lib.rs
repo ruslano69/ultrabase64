@@ -1,4 +1,6 @@
 // src/lib.rs - PyO3 0.29 + base64-simd (SIMD-движок кодирования)
+use base64_simd::AsOut;
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
 use rayon::prelude::*;
@@ -28,9 +30,55 @@ const MAX_INPUT_SIZE: usize = 100 * 1024 * 1024; // 100MB
 /// Кешированное количество доступных CPU для избежания повторных системных вызовов.
 static OPTIMAL_THREADS: OnceLock<usize> = OnceLock::new();
 
+/// Выделенный пул потоков для кодирования: фиксированные 8 потоков вместо
+/// глобального пула rayon (32 потока на 16-ядерной машине).
+/// Меньше oversubscription, меньше contention за аллокатор и память,
+/// стабильнее частоты под AVX2-нагрузкой.
+static RAYON_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+/// Расширяет время жизни среза до 'static для zero-copy работы внутри detach.
+///
+/// SAFETY: вызывающий обязан гарантировать:
+///
+/// 1. Исходный Python-объект (`Bound<PyBytes>` / `&str`) жив, пока выполняется
+///    detach-блок (держим его в текущем фрейме - refcount > 0, буфер стабилен,
+///    bytes/str иммутабельны).
+/// 2. Все потоки join'ятся строго внутри detach-блока
+///    (`rayon::ThreadPool::install` / `crossbeam::scope` это гарантируют).
+///
+/// Тогда доступ из worker-потоков всегда валиден, хотя GIL и отпущен.
+unsafe fn extend_lifetime(data: &[u8]) -> &'static [u8] {
+    std::mem::transmute(data)
+}
+
 /// Получает оптимальное количество потоков (кешированное).
 fn get_optimal_threads() -> usize {
     *OPTIMAL_THREADS.get_or_init(|| num_cpus::get().min(MAX_THREADS))
+}
+
+/// Выделенный пул потоков кодирования (ленивая инициализация).
+fn get_pool() -> &'static rayon::ThreadPool {
+    RAYON_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(get_optimal_threads())
+            .thread_name(|i| format!("ultra-b64-{i}"))
+            .build()
+            .expect("failed to build rayon thread pool")
+    })
+}
+
+/// Выделяет выходной буфер БЕЗ обнуления (без zeroing).
+///
+/// SAFETY: вызывающий обязан полностью перезаписать все `len` байт
+/// до любого чтения. В `encode_multithreaded` это гарантируется:
+/// чанки тайлят вход целиком, каждый чанк непуст и кратен 3,
+/// выходной слайс имеет точную длину len/3*4.
+#[allow(clippy::uninit_vec)]
+fn uninit_buffer(len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len);
+    // SAFETY: см. контракт выше; u8 не имеет Drop, unwind безопасен.
+    unsafe { v.set_len(len) };
+    v
 }
 
 // --- Внутренние функции ---
@@ -38,6 +86,9 @@ fn get_optimal_threads() -> usize {
 /// Оптимизированная реализация многопоточного кодирования.
 /// Параметр _num_threads сохранен для обратной совместимости, но не используется -
 /// Rayon автоматически использует оптимальное количество потоков через work-stealing.
+///
+/// Чанки кодируются SIMD напрямую в непересекающиеся слайсы предвыделенного
+/// выходного буфера: ноль промежуточных аллокаций, один проход по памяти.
 fn encode_multithreaded(input: &[u8], _num_threads: usize) -> String {
     let len = input.len();
     if len == 0 {
@@ -60,34 +111,34 @@ fn encode_multithreaded(input: &[u8], _num_threads: usize) -> String {
     // Rayon автоматически распределит чанки между потоками через work-stealing.
     // Фиксированный 1MB чанк оптимален для большинства CPU (L3 cache = 1-2MB/core).
     // ВАЖНО: chunk_size ДОЛЖЕН быть кратен 3 для корректного Base64 кодирования.
+    // Все чанки (включая последний) кратны 3, т.к. main_part_len кратно 3.
     let chunk_size = (MIN_CHUNK_SIZE / 3) * 3;
+    let chunk_out_len = chunk_size / 3 * 4;
 
-    // 4. ПАРАЛЛЕЛЬНО КОДИРУЕМ ОСНОВНУЮ ЧАСТЬ (SIMD, без padding'а)
-    let encoded_parts: Vec<String> = main_part
-        .par_chunks(chunk_size)
-        .map(|chunk| base64_simd::STANDARD_NO_PAD.encode_to_string(chunk))
-        .collect();
+    // 4. ПРЕДВЫДЕЛЯЕМ ТОЧНЫЙ ВЫХОДНОЙ БУФЕР БЕЗ ОБНУЛЕНИЯ (см. uninit_buffer)
+    let main_output_len = main_part_len / 3 * 4;
+    let mut output = uninit_buffer(main_output_len);
 
-    // 5. ЭФФЕКТИВНАЯ КОНКАТЕНАЦИЯ: предвычисляем размер для единой аллокации
-    let total_len: usize = encoded_parts.iter().map(|s| s.len()).sum();
-    let tail_encoded = if !tail_part.is_empty() {
-        base64_simd::STANDARD.encode_to_string(tail_part)
-    } else {
-        String::new()
-    };
+    // 5. ПАРАЛЛЕЛЬНО КОДИРУЕМ SIMD НАПРЯМУЮ В БУФЕР (без padding'а, без аллокаций)
+    // par_chunks_mut даёт непересекающиеся &mut-слайсы - data race исключён по типам.
+    // Работаем в выделенном пуле (8 потоков), а не в глобальном (32) - меньше contention.
+    get_pool().install(|| {
+        main_part
+            .par_chunks(chunk_size)
+            .zip(output.par_chunks_mut(chunk_out_len))
+            .for_each(|(chunk, out)| {
+                let _ = base64_simd::STANDARD_NO_PAD.encode(chunk, out.as_out());
+            });
+    });
 
-    let mut result = String::with_capacity(total_len + tail_encoded.len());
-
-    // Добавляем все части без реаллокаций
-    for part in encoded_parts {
-        result.push_str(&part);
+    // 6. ХВОСТ (< 3 байт) дописываем однопоточно
+    if !tail_part.is_empty() {
+        let tail_encoded = base64_simd::STANDARD.encode_to_string(tail_part);
+        output.extend_from_slice(tail_encoded.as_bytes());
     }
 
-    if !tail_encoded.is_empty() {
-        result.push_str(&tail_encoded);
-    }
-
-    result
+    // SAFETY: выход base64 - подмножество ASCII, всегда валидный UTF-8
+    unsafe { String::from_utf8_unchecked(output) }
 }
 
 /// Конвейерная реализация многопоточного кодирования с использованием channels.
@@ -218,32 +269,36 @@ fn is_valid_base64_length(len: usize) -> bool {
 ///     ValueError: If input is too large
 #[pyfunction]
 fn encode(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
-    let input_data = data.as_bytes().to_vec();
+    let input = data.as_bytes();
 
     // Проверка размера для защиты от OOM
-    if input_data.len() > MAX_INPUT_SIZE {
+    if input.len() > MAX_INPUT_SIZE {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "Input too large: {} bytes (max: {} bytes)",
-            input_data.len(),
+            input.len(),
             MAX_INPUT_SIZE
         )));
     }
 
-    py.detach(move || {
-        if input_data.len() < MULTITHREAD_THRESHOLD {
-            // Для небольших данных - SIMD кодирование
-            Ok(base64_simd::STANDARD.encode_to_string(&input_data))
-        } else {
-            // Для больших данных - многопоточность
-            Ok(encode_multithreaded(&input_data, get_optimal_threads()))
-        }
-    })
+    if input.len() < MULTITHREAD_THRESHOLD {
+        // Малые данные: кодируем borrow напрямую под GIL -
+        // без копии входа и без detach (время удержания GIL ~микросекунды)
+        Ok(base64_simd::STANDARD.encode_to_string(input))
+    } else {
+        // Большие данные: zero-copy + detach (GIL отпущен, вход не копируется).
+        // SAFETY: `data` жив весь вызов (см. extend_lifetime), rayon join'ится в install.
+        let input_static: &'static [u8] = unsafe { extend_lifetime(input) };
+        py.detach(move || Ok(encode_multithreaded(input_static, get_optimal_threads())))
+    }
 }
 
 /// Кодирует байты в Base64 и возвращает bytes (максимальная производительность).
 ///
-/// Аналогичен encode(), но возвращает bytes вместо string для максимальной
-/// производительности. Используйте когда результат не нужно конвертировать в string.
+/// Самый быстрый API: кодирование идёт SIMD напрямую в буфер Python-объекта,
+/// без промежуточных копий и аллокаций. Для больших данных используется
+/// выделенный пул (8 потоков). GIL удерживается на время вызова.
+///
+/// Используйте когда результат не нужно конвертировать в string.
 ///
 /// Args:
 ///     data: Bytes to encode
@@ -255,28 +310,69 @@ fn encode(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
 ///     ValueError: If input is too large
 #[pyfunction]
 fn encode_bytes(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<Py<PyBytes>> {
-    let input_data = data.as_bytes().to_vec();
+    let input = data.as_bytes();
 
     // Проверка размера для защиты от OOM
-    if input_data.len() > MAX_INPUT_SIZE {
+    if input.len() > MAX_INPUT_SIZE {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "Input too large: {} bytes (max: {} bytes)",
-            input_data.len(),
+            input.len(),
             MAX_INPUT_SIZE
         )));
     }
 
-    let encoded_string = py.detach(move || {
-        if input_data.len() < MULTITHREAD_THRESHOLD {
-            // Для небольших данных - SIMD кодирование
-            base64_simd::STANDARD.encode_to_string(&input_data)
-        } else {
-            // Для больших данных - многопоточность
-            encode_multithreaded(&input_data, get_optimal_threads())
-        }
-    });
+    let out_len = base64_simd::STANDARD.encoded_length(input.len());
 
-    Ok(PyBytes::new(py, encoded_string.as_bytes()).unbind())
+    // Однопроходное кодирование прямо в буфер PyBytes БЕЗ zeroing:
+    // PyO3::new_with обнуляет буфер (лишний проход), поэтому работаем
+    // с ffi напрямую. Ни одной промежуточной копии.
+    //
+    // SAFETY:
+    // - PyBytes_FromStringAndSize возвращает новый объект с буфером ровно
+    //   out_len байт (или NULL + exception при OOM - проверяется через
+    //   assume_owned_or_err); ссылка держится в `bound` весь блок.
+    // - `encode` пишет ровно out_len байт (контракт encoded_length),
+    //   чанки покрывают выход полностью (см. разбор в encode_multithreaded).
+    // - GIL удерживается, алиасинга нет - объект свежий, виден только нам.
+    let bound: Bound<PyBytes> = unsafe {
+        let ptr = ffi::PyBytes_FromStringAndSize(std::ptr::null(), out_len as ffi::Py_ssize_t);
+        let bound: Bound<PyBytes> = Bound::from_owned_ptr_or_err(py, ptr)?.cast_into()?;
+        let buffer = ffi::PyBytes_AsString(ptr) as *mut u8;
+        let buf: &mut [u8] = std::slice::from_raw_parts_mut(buffer, out_len);
+
+        let remainder_len = input.len() % 3;
+        let main_len = input.len() - remainder_len;
+
+        if main_len < MIN_CHUNK_SIZE * 2 {
+            // Малые данные: один SIMD-вызов на весь вход
+            let _ = base64_simd::STANDARD.encode(input, buf.as_out());
+        } else {
+            // Большие данные: чанки пишут SIMD напрямую в непересекающиеся
+            // слайсы выходного буфера (без padding'а, без аллокаций).
+            // Все чанки (включая последний) кратны 3, т.к. main_len кратно 3.
+            let (main_in, tail_in) = input.split_at(main_len);
+            let main_out_len = main_len / 3 * 4;
+            let (main_out, tail_out) = buf.split_at_mut(main_out_len);
+            let chunk_size = (MIN_CHUNK_SIZE / 3) * 3;
+            let chunk_out_len = chunk_size / 3 * 4;
+
+            get_pool().install(|| {
+                main_in
+                    .par_chunks(chunk_size)
+                    .zip(main_out.par_chunks_mut(chunk_out_len))
+                    .for_each(|(chunk, out)| {
+                        let _ = base64_simd::STANDARD_NO_PAD.encode(chunk, out.as_out());
+                    });
+            });
+
+            if !tail_in.is_empty() {
+                let _ = base64_simd::STANDARD.encode(tail_in, tail_out.as_out());
+            }
+        }
+        bound
+    };
+
+    Ok(bound.unbind())
 }
 
 /// Кодирует байты в Base64 используя конвейерную архитектуру (экспериментально).
@@ -295,18 +391,27 @@ fn encode_bytes(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<Py<PyBytes>> 
 ///     ValueError: If input is too large
 #[pyfunction]
 fn encode_pipeline_py(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
-    let input_data = data.as_bytes().to_vec();
+    let input = data.as_bytes();
 
     // Проверка размера для защиты от OOM
-    if input_data.len() > MAX_INPUT_SIZE {
+    if input.len() > MAX_INPUT_SIZE {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "Input too large: {} bytes (max: {} bytes)",
-            input_data.len(),
+            input.len(),
             MAX_INPUT_SIZE
         )));
     }
 
-    py.detach(move || Ok(encode_pipeline(&input_data)))
+    // encode_pipeline сам выбирает single-threaded для малых данных -
+    // в этом случае работаем с borrow под GIL без копии и detach.
+    if input.len() < MULTITHREAD_THRESHOLD {
+        Ok(base64_simd::STANDARD.encode_to_string(input))
+    } else {
+        // Большие данные: zero-copy + detach (crossbeam::scope join'ится внутри).
+        // SAFETY: `data` жив весь вызов, см. extend_lifetime.
+        let input_static: &'static [u8] = unsafe { extend_lifetime(input) };
+        py.detach(move || Ok(encode_pipeline(input_static)))
+    }
 }
 
 /// Кодирует байты в Base64 используя автоматический выбор алгоритма.
@@ -326,31 +431,36 @@ fn encode_pipeline_py(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String>
 ///     ValueError: If input is too large
 #[pyfunction]
 fn encode_auto(py: Python, data: &Bound<'_, PyBytes>) -> PyResult<String> {
-    let input_data = data.as_bytes().to_vec();
+    let input = data.as_bytes();
 
     // Проверка размера для защиты от OOM
-    if input_data.len() > MAX_INPUT_SIZE {
+    if input.len() > MAX_INPUT_SIZE {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "Input too large: {} bytes (max: {} bytes)",
-            input_data.len(),
+            input.len(),
             MAX_INPUT_SIZE
         )));
     }
 
-    py.detach(move || {
-        let len = input_data.len();
+    let len = input.len();
 
-        if len < MULTITHREAD_THRESHOLD {
-            // Для маленьких данных - single-threaded SIMD
-            Ok(base64_simd::STANDARD.encode_to_string(&input_data))
-        } else if len < 20 * 1024 * 1024 {
-            // Для средних данных (1-20MB) - Rayon (оптимален для L3 cache)
-            Ok(encode_multithreaded(&input_data, get_optimal_threads()))
-        } else {
-            // Для больших данных (>20MB) - Pipeline (стабильнее вне cache)
-            Ok(encode_pipeline(&input_data))
-        }
-    })
+    if len < MULTITHREAD_THRESHOLD {
+        // Малые данные: borrow напрямую под GIL
+        Ok(base64_simd::STANDARD.encode_to_string(input))
+    } else {
+        // Большие данные: zero-copy + detach.
+        // SAFETY: `data` жив весь вызов, потоки join'ятся внутри (install/scope).
+        let input_static: &'static [u8] = unsafe { extend_lifetime(input) };
+        py.detach(move || {
+            if len < 20 * 1024 * 1024 {
+                // Для средних данных (1-20MB) - Rayon (оптимален для L3 cache)
+                Ok(encode_multithreaded(input_static, get_optimal_threads()))
+            } else {
+                // Для больших данных (>20MB) - Pipeline (стабильнее вне cache)
+                Ok(encode_pipeline(input_static))
+            }
+        })
+    }
 }
 
 /// Декодирует строку Base64 в байты.
@@ -378,12 +488,23 @@ fn decode(py: Python, data: &str) -> PyResult<Py<PyBytes>> {
         ));
     }
 
-    // Скопируем строку для использования после отсоединения от интерпретатора.
-    let data_owned = data.to_owned();
+    // Малые входы декодируем borrow напрямую под GIL (без копии и detach),
+    // большие - с detach, чтобы не держать GIL.
+    if data.len() < MULTITHREAD_THRESHOLD {
+        let decoded_bytes = base64_simd::STANDARD.decode_to_vec(data).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Base64: {}", e))
+        })?;
+        return Ok(PyBytes::new(py, &decoded_bytes).unbind());
+    }
+
+    // Большие входы: zero-copy + detach (decode однопоточен, join'ить нечего,
+    // достаточно того, что `data` живёт весь вызов).
+    // SAFETY: см. extend_lifetime.
+    let data_static: &'static str = unsafe { std::mem::transmute(data) };
 
     let decoded_bytes = py.detach(move || {
         let decoded_bytes = base64_simd::STANDARD
-            .decode_to_vec(data_owned)
+            .decode_to_vec(data_static)
             .map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Base64: {}", e))
             })?;
@@ -403,9 +524,9 @@ fn decode(py: Python, data: &str) -> PyResult<Py<PyBytes>> {
 ///     Base64 encoded string
 #[pyfunction]
 fn encode_with_threads(py: Python, data: &Bound<'_, PyBytes>, threads: usize) -> PyResult<String> {
-    let input_data = data.as_bytes().to_vec();
+    let input = data.as_bytes();
 
-    if input_data.len() > MAX_INPUT_SIZE {
+    if input.len() > MAX_INPUT_SIZE {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
             "Input too large",
         ));
@@ -413,13 +534,14 @@ fn encode_with_threads(py: Python, data: &Bound<'_, PyBytes>, threads: usize) ->
 
     let num_threads = threads.clamp(1, MAX_THREADS * 2);
 
-    py.detach(move || {
-        if num_threads == 1 || input_data.len() < MIN_CHUNK_SIZE {
-            Ok(base64_simd::STANDARD.encode_to_string(&input_data))
-        } else {
-            Ok(encode_multithreaded(&input_data, num_threads))
-        }
-    })
+    if num_threads == 1 || input.len() < MIN_CHUNK_SIZE {
+        // Однопоток / малые данные: borrow напрямую под GIL
+        Ok(base64_simd::STANDARD.encode_to_string(input))
+    } else {
+        // Zero-copy + detach. SAFETY: см. extend_lifetime.
+        let input_static: &'static [u8] = unsafe { extend_lifetime(input) };
+        py.detach(move || Ok(encode_multithreaded(input_static, num_threads)))
+    }
 }
 
 /// Получает информацию о конфигурации библиотеки.
@@ -437,7 +559,7 @@ fn get_info() -> PyResult<std::collections::HashMap<String, String>> {
     info.insert("available_cpus".to_string(), num_cpus::get().to_string());
     info.insert(
         "rayon_threads".to_string(),
-        rayon::current_num_threads().to_string(),
+        get_pool().current_num_threads().to_string(),
     );
     Ok(info)
 }
