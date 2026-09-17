@@ -1,6 +1,80 @@
-# 🏆 Benchmark Results: ultrabase64 vs fastbase64 vs stdlib
+# 🏆 Benchmark Results
 
-## 📊 Performance Comparison
+## 🖥️ Тестовый стенд (замеры v1.1.1 от 2026-09-17)
+
+- **CPU**: AMD Ryzen 9 5950X (16 cores / 32 threads, 64MB L3 cache)
+- **OS**: Windows x64
+- **Python**: 3.14.6
+- **ultrabase64**: 1.1.1 (release build через maturin 1.15.0, `opt-level=3`, LTO)
+- **Зависимости**: PyO3 0.29.2, base64 0.23.1, rayon 1.12, crossbeam 0.8.5
+- **Rust**: 1.98.1
+
+Методика: случайные данные (`os.urandom`), прогрев + лучшее время из 3–20 итераций.
+
+## 📊 v1.1.1: encode_auto vs stdlib
+
+| Size | ultrabase64 (auto) | stdlib | Ускорение |
+|------|--------------------|--------|-----------|
+| 1KB | 1085.1 MB/s | 390.6 MB/s | 2.78x |
+| 10KB | 1953.1 MB/s | 465.0 MB/s | 4.20x |
+| 100KB | 589.7 MB/s | 444.9 MB/s | 1.33x |
+| 1MB | 1138.3 MB/s | 447.4 MB/s | 2.54x |
+| 5MB | 1464.3 MB/s | 445.8 MB/s | 3.29x |
+| 10MB | 1491.3 MB/s | 435.5 MB/s | 3.42x |
+| 20MB | 1239.6 MB/s | 434.9 MB/s | 2.85x |
+| 50MB | 1268.0 MB/s | 444.3 MB/s | 2.85x |
+| 100MB | 1315.4 MB/s | 436.2 MB/s | 3.02x |
+
+stdlib стабилен на ~435–465 MB/s на всех размерах; ultrabase64 быстрее в **2.5–4.2x** (медиана ~2.9x).
+
+## 📊 v1.1.1: Rayon vs Pipeline vs Auto
+
+(`test_auto.py`, 2026-09-17, тот же стенд)
+
+| Size | Rayon | Pipeline | Auto | Лучший |
+|------|-------|----------|------|--------|
+| 1MB | 1138.8 | 1167.4 | 1188.9 | Pipeline (101.8%) |
+| 2MB | 1272.0 | 1230.7 | 1271.4 | Rayon (99.9%) |
+| 5MB | 1527.3 | 1158.8 | 1165.6 | Rayon (76.3%) |
+| 10MB | 1374.9 | 1290.7 | 1287.3 | Rayon (93.6%) |
+| 15MB | 1254.3 | 1299.8 | 1284.2 | Pipeline (98.8%) |
+| 20MB | 1275.7 | 1309.8 | 1312.6 | Pipeline (100.2%) |
+| 25MB | 1324.4 | 1302.6 | 1326.6 | Rayon (100.2%) |
+| 30MB | 1255.3 | 1331.2 | 1265.3 | Pipeline (95.0%) |
+| 40MB | 1262.2 | 1338.5 | 1304.1 | Pipeline (97.4%) |
+| 50MB | 1236.1 | 1316.8 | 1322.1 | Pipeline (100.4%) |
+| 60MB | 1271.2 | 1341.6 | 1277.0 | Pipeline (95.2%) |
+| 70MB | 1283.1 | 1355.4 | 1315.5 | Pipeline (97.1%) |
+| 80MB | 1219.1 | 1367.6 | 1319.9 | Pipeline (96.5%) |
+| 90MB | 1229.7 | 1318.9 | 1316.2 | Pipeline (99.8%) |
+| 100MB | 1225.3 | 1317.3 | 1312.8 | Pipeline (99.7%) |
+
+Среднее: Rayon **1276.6 MB/s**, Pipeline **1296.5 MB/s**, Auto **1284.6 MB/s**.
+Auto в пределах 5% от лучшего в **13/15 случаев (86.7%)**, средняя эффективность 96.8%.
+
+Очный Rayon vs Pipeline (`compare_implementations.py`): среднее Rayon **1286.3 MB/s**,
+Pipeline **1297.7 MB/s**, Pipeline быстрее в 8/13 случаях
+(+9.1% на 40MB, +8.5% на 70MB, +8.9% на 100MB; Rayon заметно быстрее только на 5MB, +19.5%).
+
+## 🎯 Key Findings (R9 5950X)
+
+1. **Нет «обрыва» на 20–30MB.** В отличие от старого стенда (см. архив ниже),
+   на 5950X throughput ровный ~1220–1490 MB/s на всём диапазоне 1–100MB:
+   64MB L3 + высокая пропускная способность памяти скрывают переход за пределы кеша.
+2. **Pipeline лучше на больших объёмах** (>20MB) — стабильно +3–9% к Rayon.
+   Порог переключения Auto на 20MB подтверждается.
+3. **Auto — разумный дефолт**: 96.8% от лучшего в среднем. Просадки только
+   на 5MB (там Rayon аномально быстрый) и 10MB.
+4. **fastbase64 не замерялся**: v0.1.0 не собирается на Python 3.14 (старый maturin).
+5. **Ограничение**: `decode()` проверяет `MAX_INPUT_SIZE` (100MB) по длине
+   *закодированного* входа, поэтому пейлоады ~100MB — только encode
+   (streaming API `encode_file_streaming` / `decode_file_streaming` лимита не имеют).
+
+---
+
+## 🗄️ Архив: v1.0.13 (старый стенд)
+
+Стенд: Python 3.11.14, ultrabase64 1.0.13, fastbase64 0.1.0, CPU 16 cores, OS Linux.
 
 ### Encoding Throughput (MB/s)
 
@@ -15,100 +89,21 @@
 | **20MB** | **906.8 MB/s** | **783.1 MB/s** | 361.9 MB/s | **1.16x** ✅ | 2.51x |
 | **50MB** | **426.0 MB/s** | **387.9 MB/s** | 366.4 MB/s | **1.10x** ✅ | 1.16x |
 
-### Average Performance
+### Average Performance (старый стенд)
 
 - **ultrabase64**: 1134.6 MB/s
 - **fastbase64**: 1345.4 MB/s
 - **stdlib**: 442.3 MB/s
 
-## 🎯 Key Findings
+### Выводы старого стенда
 
-### 1. Performance by File Size
+**Small Files (≤1MB)** — fastbase64 быстрее на 25–33%.
+**Large Files (≥20MB)** — ultrabase64 выигрывал 10–16% за счёт многопоточности.
+**Crossover Point**: ~5–10MB.
 
-**Small Files (≤1MB)**
-- fastbase64 leads by 25-33%
-- ultrabase64: ~1500 MB/s
-- fastbase64: ~2000 MB/s
+### 🔬 Deep Dive: Cache Correlation Discovery (старый стенд)
 
-**Large Files (≥20MB)**
-- **ultrabase64 WINS by 10-16%** thanks to multithreading! 🏆
-- ultrabase64: ~900 MB/s (20MB), ~430 MB/s (50MB)
-- fastbase64: ~783 MB/s (20MB), ~388 MB/s (50MB)
-
-**Crossover Point**: ~5-10MB
-- Below this size: fastbase64 leads
-- Above this size: ultrabase64's multithreading pays off
-
-### 2. ultrabase64 Unique Features
-
-✅ **Streaming API** - Process files of ANY size without loading into memory
-✅ **Multithreading** - Automatic scaling across 4-8 cores
-✅ **Returns Python string** (not bytes) - More convenient
-✅ **GIL-free processing** - Doesn't block other Python threads
-✅ **Configurable threads** via `encode_with_threads()`
-✅ **L3 cache optimization** - 1MB chunks for optimal cache usage
-
-### 3. fastbase64 Advantages
-
-✅ Faster on small files (<5MB)
-✅ More compact library
-✅ Simple API without additional options
-
-## 📈 Visualization
-
-```
-Speedup: ultrabase64 vs fastbase64
-   1KB: 🔴 0.67x (fastbase64 faster)
-  10KB: 🔴 0.74x (fastbase64 faster)
- 100KB: 🔴 0.81x (fastbase64 faster)
-   1MB: 🔴 0.80x (fastbase64 faster)
-   5MB: 🔴 0.94x (fastbase64 faster)
-  10MB: 🔴 0.88x (fastbase64 faster)
-  20MB: 🟢 1.16x (ultrabase64 FASTER) ✅
-  50MB: 🟢 1.10x (ultrabase64 FASTER) ✅
-```
-
-## 💡 Recommendations
-
-### Use ultrabase64 when:
-- Processing files >10MB
-- Need streaming for huge files (>100MB)
-- Multithreading is important
-- Need result as string
-- Processing in production with mixed file sizes
-
-### Use fastbase64 when:
-- Processing many small files (<1MB)
-- Maximum speed on small data is critical
-- Bytes result is sufficient
-- Single-threaded is acceptable
-
-## 🏆 Conclusion
-
-**ultrabase64 shows EXCELLENT results:**
-
-✅ **WINNER for large files** (>20MB) - 10-16% faster
-✅ **UNIQUE streaming capability** for unlimited file sizes
-✅ **Automatic multithreading** without configuration
-✅ **2.55x faster than stdlib** on average
-
-⚠️ Slightly slower on small files (<5MB), but difference is negligible for most use cases.
-
-**VERDICT**: ultrabase64 is the optimal choice for production systems handling files of varying sizes, especially large ones.
-
-## Test Environment
-
-- Python: 3.11.14
-- ultrabase64: 1.0.13
-- fastbase64: 0.1.0
-- CPU: 16 cores (L3 cache limit ~20-30MB)
-- OS: Linux
-
-## 🔬 Deep Dive: Cache Correlation Discovery
-
-### Performance Cliff at 20-30MB
-
-**Critical Finding**: Both libraries show ~50% performance drop between 20MB and 30MB.
+**Performance Cliff at 20–30MB**: обе библиотеки показывали ~50% просадку между 20MB и 30MB.
 
 ```
 Size  | ultrabase64 | fastbase64 | Drop
@@ -120,41 +115,6 @@ Size  | ultrabase64 | fastbase64 | Drop
 50MB  |  426 MB/s   |  388 MB/s  | stable
 ```
 
-### Root Cause: CPU Cache Exhaustion
-
-**Zone 1: Inside Cache (< 20-25MB)**
-- Data fits in L3 cache
-- Low latency access (~40 cycles)
-- High throughput: 1400-1900 MB/s ✅
-
-**Zone 2: Outside Cache (> 25-30MB)**
-- Cache misses, RAM access required
-- High latency access (~200 cycles)
-- Reduced throughput: 400-450 MB/s ⚠️
-
-### Memory Hierarchy
-
-```
-Level    | Size/Core    | Latency   | Speed
----------|--------------|-----------|-------------
-L1 Cache | 32-64 KB     | ~1 cycle  | Fastest
-L2 Cache | 256KB-1MB    | ~10 cycles| Fast
-L3 Cache | 8-30MB (shared) | ~40 cycles | Moderate ← LIMIT HERE
-RAM      | 8-64GB       | ~200 cycles| Slow     ← FALLS HERE
-```
-
-### Why Both Libraries Drop
-
-This is **NOT a bug** - it's a **fundamental hardware limitation**:
-- L3 cache size: ~20-30MB effective for workload
-- Beyond this: mandatory RAM access
-- RAM bandwidth: ~400-500 MB/s (saturated)
-
-### Why ultrabase64 Still Wins
-
-Even outside cache, multithreading provides ~10% advantage:
-- Parallel memory bandwidth utilization
-- Better latency hiding
-- More efficient memory controller usage
-
-**Conclusion**: The 1MB chunk size optimization works **perfectly** within cache bounds (1900 MB/s peak). The plateau at 430 MB/s for large files is the **physical RAM bandwidth limit**, not a software issue.
+Причина — исчерпание L3 кеша (~20–30MB effective) и упёртость в пропускную
+способность RAM (~400–500 MB/s) на той машине. На R9 5950X (64MB L3)
+этот эффект не воспроизводится — см. замеры v1.1.1 выше.
