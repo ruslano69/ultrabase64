@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-17
+
+### Changed
+
+#### SIMD engine: `base64` -> `base64-simd`
+- Replaced the table-based `base64` crate with SIMD-accelerated `base64-simd` 0.8
+  (runtime AVX2/SSE/NEON detection) on all paths: single-threaded, Rayon chunks
+  (`STANDARD_NO_PAD`), pipeline workers, streaming encode/decode
+- Removed the `base64` dependency and the `OnceLock` no-pad engine
+  (`base64-simd` is stateless)
+- `get_info()` now reports `"engine": "base64-simd"`
+
+### Performance (Ryzen 9 5950X, vs v1.1.1)
+
+- 128KB `encode`: ~1.0 GB/s -> **~4.4 GB/s**
+- 128KB `encode_bytes`: ~0.8 GB/s -> **~7.4 GB/s**
+- 1MB: ~1.2 GB/s -> **~1.9 GB/s**, 10MB: ~1.3 GB/s -> **~1.65 GB/s**
+- Auto-selection matrix average: ~1285 MB/s -> **~1410 MB/s**
+- Gap to pybase64 (AVX2) on 128KB closed from ~5-20x to ~1.8-3x
+
+No API changes - fully compatible with v1.1.x.
+
 ## [1.1.1] - 2026-09-17
 
 ### Changed
