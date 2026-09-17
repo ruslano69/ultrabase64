@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-09-17
+
+### Changed
+
+#### Dependencies
+- `pyo3` 0.21 -> 0.29.2 (migration to `Bound` API, `Python::detach`, `PyModule`)
+- `base64` 0.21 -> 0.23.1
+- `rayon` 1.8 -> 1.12
+- `num_cpus` 1.16 -> 1.17
+- `crossbeam` 0.8 -> 0.8.4
+- `rust-version` 1.70 -> 1.83
+
+### Fixed
+
+- Fixed type inference error (`E0282`) in `encode_bytes` with the new PyO3 `detach` API
+- Replaced manual `div_ceil` with `usize::div_ceil` (clippy clean on Rust 1.98)
+- Reformatted with current `rustfmt`
+
 ## [1.1.0] - 2024-01-13
 
 ### Added
